@@ -74,9 +74,12 @@ export interface StoredConfig {
   richToolDescriptions?: boolean;  // Add intent/action metadata to all tool calls (default: true)
   // Tools
   browserToolEnabled?: boolean;  // Enable built-in browser tool (default: true). Disable for Playwright/Puppeteer.
+  allowRemoteEvaluate?: boolean;  // Allow remote agents to call `browser_tool evaluate` on local browser (default: true).
   // Prompt caching & context
   extendedPromptCache?: boolean;  // Use 1h prompt cache TTL instead of 5m (default: false)
   enable1MContext?: boolean;  // Enable 1M context window for supported models (default: false — opt-in; requires Anthropic Tier 4+)
+  // Token optimization
+  rtkEnabled?: boolean;  // Route Bash commands through rtk to compress tool output (default: false). https://github.com/rtk-ai/rtk
   // Network proxy
   networkProxy?: import('./types.ts').NetworkProxySettings;
   // Windows: path to Git Bash (bash.exe) for the SDK subprocess
@@ -118,6 +121,7 @@ const FALLBACK_CONFIG_DEFAULTS: ConfigDefaults = {
     richToolDescriptions: true,
     extendedPromptCache: false,
     browserToolEnabled: true,
+    allowRemoteEvaluate: true,
   },
   workspaceDefaults: {
     thinkingLevel: 'medium',
@@ -477,6 +481,30 @@ export function setBrowserToolEnabled(enabled: boolean): void {
 }
 
 /**
+ * Whether remote agents may call `browser_tool evaluate <expression>` against this
+ * desktop client's local browser. The check is enforced inside the local capability
+ * dispatcher; the remote server cannot override it.
+ *
+ * Defaults to true. Users can flip it off in Settings → AI → Advanced if they don't
+ * trust the remote workspaces they connect to.
+ */
+export function getAllowRemoteEvaluate(): boolean {
+  const config = loadStoredConfig();
+  if (config?.allowRemoteEvaluate !== undefined) {
+    return config.allowRemoteEvaluate;
+  }
+  const defaults = loadConfigDefaults();
+  return defaults.defaults.allowRemoteEvaluate;
+}
+
+export function setAllowRemoteEvaluate(allowed: boolean): void {
+  const config = loadStoredConfig();
+  if (!config) return;
+  config.allowRemoteEvaluate = allowed;
+  saveConfig(config);
+}
+
+/**
  * Get whether 1M context window is enabled.
  * When disabled, models use 200K context and the interceptor strips the context-1m beta header.
  * Defaults to false — the 1M beta requires Anthropic Tier 4+, and enabling it by default
@@ -495,6 +523,28 @@ export function setEnable1MContext(enabled: boolean): void {
   const config = loadStoredConfig();
   if (!config) return;
   config.enable1MContext = enabled;
+  saveConfig(config);
+}
+
+/**
+ * Get whether rtk Bash-output compression is enabled.
+ * When enabled, the PreToolUse pipeline rewrites Bash commands to their `rtk` equivalents
+ * to reduce token consumption on common dev commands (git, ls, grep, test runners, etc.).
+ * Defaults to false — opt-in. Requires the `rtk` binary on PATH or bundled with the app.
+ * https://github.com/rtk-ai/rtk
+ */
+export function getRtkEnabled(): boolean {
+  const config = loadStoredConfig();
+  return config?.rtkEnabled === true;
+}
+
+/**
+ * Set whether rtk Bash-output compression is enabled.
+ */
+export function setRtkEnabled(enabled: boolean): void {
+  const config = loadStoredConfig();
+  if (!config) return;
+  config.rtkEnabled = enabled;
   saveConfig(config);
 }
 
@@ -986,7 +1036,7 @@ export function clearWorkspacePlan(workspaceId: string): void {
 const DRAFTS_FILE = join(CONFIG_DIR, 'drafts.json');
 
 export interface DraftAttachmentContent {
-  type: 'image' | 'pdf' | 'text' | 'office' | 'unknown';
+  type: 'image' | 'pdf' | 'text' | 'office' | 'audio' | 'unknown';
   mimeType: string;
   size: number;
   base64?: string;
@@ -1012,7 +1062,7 @@ interface DraftsData {
   updatedAt: number;
 }
 
-const ATTACHMENT_CONTENT_TYPES = new Set(['image', 'pdf', 'text', 'office', 'unknown']);
+const ATTACHMENT_CONTENT_TYPES = new Set(['image', 'pdf', 'text', 'office', 'audio', 'unknown']);
 
 function isAbsoluteDraftPath(p: string): boolean {
   if (!p) return false;
@@ -2583,6 +2633,8 @@ export function updateLlmConnection(slug: string, updates: Partial<Omit<LlmConne
     piAuthProvider: updates.piAuthProvider !== undefined ? updates.piAuthProvider : existing.piAuthProvider,
     // Custom endpoint protocol (Anthropic/OpenAI compatible)
     customEndpoint: updates.customEndpoint !== undefined ? updates.customEndpoint : existing.customEndpoint,
+    // Mid-stream send behavior (steer vs queue) — read via resolveMidStreamBehavior()
+    midStreamBehavior: updates.midStreamBehavior !== undefined ? updates.midStreamBehavior : existing.midStreamBehavior,
     // Timestamps
     lastUsedAt: updates.lastUsedAt !== undefined ? updates.lastUsedAt : existing.lastUsedAt,
   };
