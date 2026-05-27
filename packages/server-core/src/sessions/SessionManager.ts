@@ -1,5 +1,7 @@
-import type { EventSink } from '@craft-agent/server-core/transport'
+import type { EventSink, RpcServer } from '@craft-agent/server-core/transport'
+import { CLIENT_BROWSER_INVOKE } from '@craft-agent/server-core/transport'
 import type { ISessionManager, IBrowserPaneManager, ExecutePromptAutomationInput } from '@craft-agent/server-core/handlers'
+import { RemoteBrowserPaneManager } from './RemoteBrowserPaneManager'
 import { validateFilePath, getWorkspaceAllowedDirs } from '@craft-agent/server-core/handlers'
 import { createScopedLogger, CONSOLE_LOGGER, type PlatformServices, type Logger } from '@craft-agent/server-core/runtime'
 import { basename, dirname, join } from 'path'
@@ -18,7 +20,7 @@ import {
   type BackendHostRuntimeContext,
   type PostInitResult,
 } from '@craft-agent/shared/agent/backend'
-import { getLlmConnection, getLlmConnections, getDefaultLlmConnection, getDefaultThinkingLevel, resetManagedAnthropicAuthEnvVars } from '@craft-agent/shared/config'
+import { getLlmConnection, getLlmConnections, getDefaultLlmConnection, getDefaultThinkingLevel, resetManagedAnthropicAuthEnvVars, resolveMidStreamBehavior } from '@craft-agent/shared/config'
 import { PrivilegedExecutionBroker } from '@craft-agent/server-core/services'
 import { isValidWorkingDirectory } from '../utils/path-validation'
 import { InitGate } from '@craft-agent/server-core/domain'
@@ -94,6 +96,7 @@ import { extractLabelId, resolveSessionLabels } from '@craft-agent/shared/labels
 import { ensureLabelsExist } from '@craft-agent/shared/labels/crud'
 import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
 import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot } from '@craft-agent/shared/automations'
+import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
@@ -168,6 +171,11 @@ const MAX_ADMIN_REMEMBER_MINUTES = 60
 const MAX_ANNOTATIONS_PER_MESSAGE = 200
 const MAX_ANNOTATION_JSON_BYTES = 32 * 1024
 
+// Window during which fs.watch metadata-revert events from our own atomic write
+// are ignored, so the watcher does not roll back the in-memory mutation we
+// just persisted. See onSessionMetadataChange.
+const METADATA_WRITE_GUARD_MS = 5000
+
 /**
  * Text sent to the session when a plan is approved from outside the desktop
  * UI (e.g. Telegram button). Mirrors the English `plan.approved` i18n key
@@ -190,7 +198,7 @@ function getPiTurnAnchorsPath(sessionPath: string): string {
   return join(sessionPath, 'meta', PI_TURN_ANCHORS_FILE)
 }
 
-async function loadPiTurnAnchors(sessionPath: string): Promise<PiTurnAnchorsIndex> {
+export async function loadPiTurnAnchors(sessionPath: string): Promise<PiTurnAnchorsIndex> {
   const filePath = getPiTurnAnchorsPath(sessionPath)
   try {
     const raw = await readFile(filePath, 'utf-8')
@@ -220,7 +228,7 @@ async function getPiTurnAnchor(sessionPath: string, messageId: string): Promise<
   return index.anchors[messageId]
 }
 
-async function savePiTurnAnchor(sessionPath: string, messageId: string, anchorId: string): Promise<void> {
+export async function savePiTurnAnchor(sessionPath: string, messageId: string, anchorId: string): Promise<void> {
   if (!messageId || !anchorId) return
 
   const index = await loadPiTurnAnchors(sessionPath)
@@ -231,6 +239,39 @@ async function savePiTurnAnchor(sessionPath: string, messageId: string, anchorId
   const filePath = getPiTurnAnchorsPath(sessionPath)
   await mkdir(join(sessionPath, 'meta'), { recursive: true })
   await writeFile(filePath, JSON.stringify(index), 'utf-8')
+}
+
+/**
+ * Copy Pi turn anchors from the source session into the branch session,
+ * filtered to the messages actually carried into the branch.
+ *
+ * Without this, branching a branch is silently lossy: the source branch's
+ * sidecar contains no anchors for messages copied from its own parent, so a
+ * downstream branch falls back to "full-history fork" — discarding the
+ * branch cutoff and producing a session whose visible history doesn't match
+ * what the LLM sees. See craft-agents-oss#782.
+ */
+export async function copyPiTurnAnchorsForBranch(
+  sourceSessionPath: string,
+  branchSessionPath: string,
+  branchedMessageIds: Iterable<string>,
+): Promise<void> {
+  const index = await loadPiTurnAnchors(sourceSessionPath)
+  if (Object.keys(index.anchors).length === 0) return
+  const idSet = new Set(branchedMessageIds)
+  const filtered: Record<string, string> = {}
+  for (const [messageId, anchor] of Object.entries(index.anchors)) {
+    if (idSet.has(messageId)) {
+      filtered[messageId] = anchor
+    }
+  }
+  if (Object.keys(filtered).length === 0) return
+  await mkdir(join(branchSessionPath, 'meta'), { recursive: true })
+  await writeFile(
+    getPiTurnAnchorsPath(branchSessionPath),
+    JSON.stringify({ version: PI_TURN_ANCHORS_VERSION, anchors: filtered }),
+    'utf-8',
+  )
 }
 
 const CLAUDE_TURN_ANCHORS_VERSION = 1
@@ -362,21 +403,61 @@ async function buildServersFromSources(
     return undefined
   }
 
+  // Per-request credential getter for non-OAuth / non-renew API sources
+  // (bearer / header / query / basic auth).
+  //
+  // Without this, the in-process API tool captures the credential as a static
+  // string at build time and keeps using it forever — meaning a fresh JWT
+  // entered via source_credential_prompt is ignored until session restart.
+  //
+  // With this getter, every API call reads the latest credential from the
+  // vault, so credential updates take effect on the next call. OAuth and
+  // renew-endpoint sources have their own refresh logic via TokenRefreshManager
+  // and are skipped here.
+  const getCredentialForSource = (source: LoadedSource) => {
+    if (source.config.type !== 'api') return undefined
+    if (source.config.api?.authType === 'none') return undefined
+    if (isApiOAuthProvider(source.config.provider)) return undefined
+    if (source.config.api?.authType === 'oauth') return undefined
+    if (hasRenewEndpoint(source)) return undefined
+    return async () => credManager.getApiCredential(source)
+  }
+
   // Pass sessionPath to enable saving large API responses to session folder
-  const result = await serverBuilder.buildAll(sourcesWithCreds, getTokenForSource, sessionPath, summarize)
+  const result = await serverBuilder.buildAll(
+    sourcesWithCreds,
+    getTokenForSource,
+    sessionPath,
+    summarize,
+    getCredentialForSource,
+  )
   span.mark('servers.built')
   span.setMetadata('mcpCount', Object.keys(result.mcpServers).length)
   span.setMetadata('apiCount', Object.keys(result.apiServers).length)
 
-  // Update source configs for auth errors so UI reflects actual state
+  // Update source configs for auth errors so UI reflects actual state.
+  // Re-classify AUTH_REQUIRED → TOKEN_EXPIRED when the credential is merely
+  // expired-but-refreshable; in that case the refresh cycle handles recovery
+  // and we must NOT prematurely mark the source as needing re-auth (#710).
   for (const error of result.errors) {
-    if (error.error === SERVER_BUILD_ERRORS.AUTH_REQUIRED) {
-      const source = sources.find(s => s.config.slug === error.sourceSlug)
-      if (source) {
-        credManager.markSourceNeedsReauth(source, 'Token missing or expired')
-        sessionLog.info(`Marked source ${error.sourceSlug} as needing re-auth`)
-      }
+    if (error.error !== SERVER_BUILD_ERRORS.AUTH_REQUIRED) continue
+    const source = sources.find(s => s.config.slug === error.sourceSlug)
+    if (!source) continue
+
+    const cred = await credManager.load(source)
+    const isExpiredRefreshable =
+      cred &&
+      (credManager.isExpired(cred) || credManager.needsRefresh(cred)) &&
+      (cred.refreshToken || hasRenewEndpoint(source))
+
+    if (isExpiredRefreshable) {
+      error.error = SERVER_BUILD_ERRORS.TOKEN_EXPIRED
+      sessionLog.debug(`Source ${error.sourceSlug}: TOKEN_EXPIRED — refresh cycle will handle`)
+      continue
     }
+
+    credManager.markSourceNeedsReauth(source, 'Token missing or expired')
+    sessionLog.info(`Marked source ${error.sourceSlug} as needing re-auth`)
   }
 
   span.end()
@@ -384,80 +465,49 @@ async function buildServersFromSources(
 }
 
 /**
- * Result of OAuth token refresh operation.
+ * Result of expired-credential refresh.
  */
-interface OAuthTokenRefreshResult {
-  /** Whether any tokens were refreshed (configs were updated) */
-  tokensRefreshed: boolean
+interface RefreshExpiredCredentialsResult {
+  /** Number of sources whose tokens were successfully refreshed */
+  refreshedCount: number
   /** Sources that failed to refresh (for warning display) */
   failedSources: Array<{ slug: string; reason: string }>
 }
 
 /**
- * Refresh expired OAuth tokens and rebuild server configs.
- * Uses TokenRefreshManager for unified refresh logic (DRY/SOLID principles).
+ * Refresh expired OAuth / renew-endpoint tokens for the given sources.
  *
- * This implements "proactive refresh at query time" - tokens are refreshed before
- * each agent.chat() call, then server configs are rebuilt with fresh headers.
+ * Side effects (carried by `TokenRefreshManager.ensureFreshToken`):
+ * - Success: source.config.isAuthenticated = true (in-memory + on disk).
+ * - Failure: source.config.isAuthenticated = false + connectionStatus = 'needs_auth'
+ *   (in-memory + on disk), so isSourceUsable() returns false and the source is
+ *   excluded from intendedSlugs by callers.
  *
- * Handles both:
- * - MCP OAuth sources (e.g., Linear, Notion)
- * - API OAuth sources (Google, Slack, Microsoft)
- *
- * @param agent - The agent to update server configs on
- * @param sources - All loaded sources for the session
- * @param sessionPath - Path to session folder for API response storage
- * @param tokenRefreshManager - TokenRefreshManager instance for this session
+ * The caller is responsible for building servers AFTER this returns — that way
+ * a single fresh build sees the correct credentials and the correct usable set.
+ * Issue #710.
  */
-async function refreshOAuthTokensIfNeeded(
-  agent: AgentInstance,
+async function refreshExpiredCredentials(
   sources: LoadedSource[],
-  sessionPath: string,
-  tokenRefreshManager: TokenRefreshManager,
-  options?: { sessionId?: string; workspaceRootPath?: string; poolServerUrl?: string }
-): Promise<OAuthTokenRefreshResult> {
-  sessionLog.debug('[OAuth] Checking if any OAuth tokens need refresh')
+  tokenRefreshManager: TokenRefreshManager
+): Promise<RefreshExpiredCredentialsResult> {
+  sessionLog.debug('[OAuth] Checking if any tokens need refresh')
 
-  // Use TokenRefreshManager to find sources needing refresh (handles rate limiting)
   const needRefresh = await tokenRefreshManager.getSourcesNeedingRefresh(sources)
-
   if (needRefresh.length === 0) {
-    return { tokensRefreshed: false, failedSources: [] }
+    return { refreshedCount: 0, failedSources: [] }
   }
 
-  sessionLog.debug(`[OAuth] Found ${needRefresh.length} source(s) needing token refresh: ${needRefresh.map(s => s.config.slug).join(', ')}`)
+  sessionLog.debug(`[OAuth] Refreshing ${needRefresh.length} source(s): ${needRefresh.map(s => s.config.slug).join(', ')}`)
 
-  // Use TokenRefreshManager to refresh all tokens (handles rate limiting and error tracking)
   const { refreshed, failed } = await tokenRefreshManager.refreshSources(needRefresh)
 
-  // Convert failed results to the expected format
   const failedSources = failed.map(({ source, reason }) => ({
     slug: source.config.slug,
     reason,
   }))
 
-  if (refreshed.length > 0) {
-    // Rebuild server configs with fresh tokens
-    sessionLog.debug(`[OAuth] Rebuilding servers after ${refreshed.length} token refresh(es)`)
-    const enabledSources = sources.filter(isSourceUsable)
-    const { mcpServers, apiServers } = await buildServersFromSources(
-      enabledSources,
-      sessionPath,
-      tokenRefreshManager,
-      agent.getSummarizeCallback()
-    )
-    const intendedSlugs = enabledSources.map(s => s.config.slug)
-    await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
-
-    // Update bridge-mcp-server config/credentials for backends that need it
-    if (options?.sessionId && options?.workspaceRootPath) {
-      await applyBridgeUpdates(agent, sessionPath, enabledSources, mcpServers, options.sessionId, options.workspaceRootPath, 'token refresh', options.poolServerUrl)
-    }
-
-    return { tokensRefreshed: true, failedSources }
-  }
-
-  return { tokensRefreshed: false, failedSources }
+  return { refreshedCount: refreshed.length, failedSources }
 }
 
 /**
@@ -870,9 +920,69 @@ interface ManagedSession {
   // Per-session env overrides for SDK subprocess (e.g., ANTHROPIC_BASE_URL).
   // Stored on managed session so it persists across agent recreations (auth-retry, etc.)
   envOverrides?: Record<string, string>
+  // Runtime-affecting backend config signature captured when the live agent was created/refreshed.
+  backendRuntimeSignature?: string
+  /**
+   * Signature over fields that cannot be propagated via `update_runtime_config`
+   * (see `runtime-config.ts:buildRestartRequiredSignature`). When this drifts,
+   * the agent must be disposed + recreated rather than refreshed in place.
+   */
+  backendRestartSignature?: string
   // Whether the previous turn was interrupted (for context injection on next message).
   // Ephemeral — not persisted to disk. Cleared after one-shot injection.
   wasInterrupted?: boolean
+  /**
+   * Runtime-only: Pi SDK message id → Craft assistant message id.
+   * Populated when a `text_complete` arrives carrying `sdkMessageId`, and read
+   * when the follow-up `pi_turn_anchor` event arrives (deferred by one microtask
+   * so the SDK's session-manager has updated its leaf — see craft-agents-oss#782).
+   * Capped at PI_SDK_MESSAGE_ID_CACHE_LIMIT to bound memory in long sessions.
+   */
+  piSdkMessageToCraftMessage?: Map<string, string>
+  // Source-activation auto-retry (craft-agents-oss#804). When a source activates
+  // mid-turn, we re-send the original message with a "[<slug> activated]" suffix
+  // after a short delay. The pending slot lets `sendMessage` dedup a duplicate
+  // RPC from a legacy renderer that still ships the client-side auto_retry.
+  autoRetryTimer?: ReturnType<typeof setTimeout>
+  autoRetryPending?: {
+    content: string
+    deadlineMs: number
+    /** True after the first matching sendMessage consumes the slot; later matches drop. */
+    committed: boolean
+  }
+}
+
+const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
+
+export interface AutoRetryPendingHost {
+  autoRetryPending?: {
+    content: string
+    deadlineMs: number
+    committed: boolean
+  }
+}
+
+export function claimAutoRetryPending(
+  host: AutoRetryPendingHost,
+  message: string,
+  nowMs = Date.now(),
+): 'send' | 'drop' {
+  const pending = host.autoRetryPending
+  if (pending && message === pending.content) {
+    if (nowMs < pending.deadlineMs) {
+      if (pending.committed) return 'drop'
+      pending.committed = true
+      return 'send'
+    }
+    host.autoRetryPending = undefined
+    return 'send'
+  }
+
+  if (pending && nowMs >= pending.deadlineMs) {
+    host.autoRetryPending = undefined
+  }
+
+  return 'send'
 }
 
 /**
@@ -1026,8 +1136,30 @@ export class SessionManager implements ISessionManager {
   private initGate = new InitGate()
   // O(1) index: taskId → sessionId for background task output lookup (avoids O(n) session scan)
   private taskOutputIndex: Map<string, string> = new Map()
+  /**
+   * Per-session in-flight runtime-refresh promise. Ensures `updateRuntimeConfig`
+   * (or a dispose) cannot overlap with another refresh OR with a send-path
+   * `getOrCreateAgent` on the same session. Without this serialization, a
+   * `SAVE`-triggered refresh and a `sendMessage`-triggered refresh can both
+   * see `agent.isProcessing()=false`, both fire `updateRuntimeConfig`, and the
+   * subprocess can race the resulting `chat` against the still-pending update.
+   */
+  private agentRefreshLocks: Map<string, Promise<void>> = new Map()
   /** Monotonic clock to ensure strictly increasing message timestamps */
   private lastTimestamp = 0
+
+  /**
+   * Optional binder installed by the messaging-gateway bootstrap. When set,
+   * `executePromptAutomation` calls it after creating a session whose matcher
+   * declared `telegramTopic`, so the new session is bound to a Telegram forum
+   * topic in the workspace's paired supergroup. Best-effort — failures must
+   * not block the session.
+   */
+  private automationBinder?: (input: {
+    workspaceId: string
+    sessionId: string
+    topicName: string
+  }) => Promise<void>
 
   /**
    * Centralized setter for session processing state.
@@ -1050,7 +1182,22 @@ export class SessionManager implements ISessionManager {
     return this.initGate.wait()
   }
 
+  /**
+   * Install the automation→topic binder. Wired by the messaging-gateway
+   * bootstrap so SessionManager doesn't need to import the messaging
+   * package (avoids a package-level circular dependency).
+   */
+  setAutomationBinder(
+    fn: (input: { workspaceId: string; sessionId: string; topicName: string }) => Promise<void>,
+  ): void {
+    this.automationBinder = fn
+  }
+
   private browserPaneManager: IBrowserPaneManager | null = null
+  private rpcServer: RpcServer | null = null
+  private remoteBpms = new Map<string, RemoteBrowserPaneManager>()
+  /** Pinned desktop client per session for `client:browser:invoke` routing. */
+  private browserHostByCanvas = new Map<string, string>()
   private eventSink: EventSink | null = null
 
   setEventSink(sink: EventSink): void {
@@ -1060,6 +1207,100 @@ export class SessionManager implements ISessionManager {
   setBrowserPaneManager(bpm: IBrowserPaneManager): void {
     this.browserPaneManager = bpm
     bpm.setSessionPathResolver((sessionId) => this.getSessionPath(sessionId))
+  }
+
+  /**
+   * Provide the WS RPC server so remote clients can host browser tools.
+   *
+   * When called, the SM activates the remote-bridge code path: per-session
+   * `RemoteBrowserPaneManager` instances are created lazily by
+   * {@link getBrowserPaneManagerForSession}, and the browser-host client is
+   * resolved via {@link getBrowserHostClient} with capability-aware fallback.
+   *
+   * Local Electron callers do not need to call this — they already
+   * call `setBrowserPaneManager(bpm)` with the in-process BPM, which takes
+   * precedence over the remote bridge in {@link getBrowserPaneManagerForSession}.
+   */
+  setRpcServer(server: RpcServer): void {
+    this.rpcServer = server
+    sessionLog.info('[browser-pane] setRpcServer called — remote browser bridge is now available')
+  }
+
+  /**
+   * Resolve the {@link IBrowserPaneManager} that owns the user's local browser
+   * for a given session. Returns:
+   *
+   * 1. The locally-injected `browserPaneManager` when present (Electron client co-located
+   *    with the agent), regardless of session.
+   * 2. A session-bound {@link RemoteBrowserPaneManager} when `rpcServer` is set.
+   *    Cached in `remoteBpms` so repeat lookups don't allocate.
+   * 3. `null` when there's neither a local BPM nor an RPC server.
+   */
+  getBrowserPaneManagerForSession(sid: string): IBrowserPaneManager | null {
+    if (this.browserPaneManager) return this.browserPaneManager
+    if (!this.rpcServer) return null
+
+    const cached = this.remoteBpms.get(sid)
+    if (cached) return cached
+
+    const session = this.sessions.get(sid)
+    if (!session) return null
+
+    const bridge = new RemoteBrowserPaneManager({
+      sessionId: sid,
+      workspaceId: session.workspace.id,
+      rpcServer: this.rpcServer,
+      getHostClient: () => this.getBrowserHostClient(sid),
+    })
+    this.remoteBpms.set(sid, bridge)
+    return bridge
+  }
+
+  /**
+   * Record which desktop client should host this session's browser. Called
+   * with `ctx.clientId` from the `sessions.sendMessage` RPC handler so the
+   * agent's browser_* tools route back to the client that posted the message.
+   *
+   * No-op when `callerClientId` is undefined — preserves the existing pin
+   * (lets reconnected clients continue holding the host role).
+   */
+  private setLastMessageClientId(sid: string, callerClientId: string | undefined): void {
+    if (!callerClientId) return
+    this.browserHostByCanvas.set(sid, callerClientId)
+  }
+
+  /**
+   * Called by the transport bootstrap on `onClientDisconnected`. Drops any
+   * pins held by `clientId` so the next browser tool call re-resolves via
+   * {@link findClientsWithCapability} instead of trying to ship to a dead client.
+   */
+  onClientDisconnected(clientId: string): void {
+    for (const [sid, pinned] of this.browserHostByCanvas) {
+      if (pinned === clientId) this.browserHostByCanvas.delete(sid)
+    }
+  }
+
+  /**
+   * Pinned client first, with fallback to any connected client for the workspace
+   * that advertises `client:browser:invoke`. The fallback handles reconnect-with-
+   * new-clientId so the agent isn't stuck waiting for another user message.
+   */
+  private getBrowserHostClient(sid: string): string | null {
+    if (!this.rpcServer) return null
+    const pinned = this.browserHostByCanvas.get(sid)
+    if (pinned && this.rpcServer.hasClientCapability(pinned, CLIENT_BROWSER_INVOKE)) {
+      return pinned
+    }
+    const session = this.sessions.get(sid)
+    if (!session) return null
+    const candidates = this.rpcServer.findClientsWithCapability(
+      CLIENT_BROWSER_INVOKE,
+      { workspaceId: session.workspace.id },
+    )
+    const fallback = candidates[0]
+    if (!fallback) return null
+    this.browserHostByCanvas.set(sid, fallback)
+    return fallback
   }
 
   /** Returns a strictly increasing timestamp (ms). When Date.now() collides with
@@ -1355,6 +1596,7 @@ export class SessionManager implements ISessionManager {
                 model: pending.model,
                 thinkingLevel: pending.thinkingLevel,
                 automationName: pending.automationName,
+                telegramTopic: pending.telegramTopic,
               })
             )
           )
@@ -1653,20 +1895,88 @@ export class SessionManager implements ISessionManager {
     }
   }
 
-  // Persist a session to disk (async with debouncing)
+  // Suppress fs.watch metadata-revert events for the window in which our own
+  // atomic write completes. See onSessionMetadataChange.
+  private setMetadataWriteGuard(managed: ManagedSession): void {
+    managed._metadataWriteGuardUntil = Date.now() + METADATA_WRITE_GUARD_MS
+  }
+
+  /**
+   * Persist a session to disk (async, with debouncing in the persistence queue).
+   *
+   * Cold-session path: if messages haven't been lazy-loaded yet, hydrate them
+   * synchronously from the JSONL first — otherwise the snapshot we enqueue
+   * would write `messages: []` over the real messages on disk. Hydration
+   * deliberately does NOT touch persistent metadata fields (name, labels,
+   * sessionStatus, llmConnection, ...) because the caller may have just
+   * mutated them; the in-memory mutation must win over what's on disk.
+   * `loadStoredSession` is synchronous (sync fs reads), so the entire path
+   * stays sync — no microtask race window between the load and the enqueue.
+   */
   private persistSession(managed: ManagedSession): void {
+    if (!managed.messagesLoaded) {
+      this.hydrateMessagesForColdPersist(managed)
+    }
+    this.enqueuePersist(managed)
+  }
+
+  // Cold-persist hydration. Mirrors the messages/queue-recovery half of
+  // loadMessagesFromDisk but skips the metadata field syncs. Sets
+  // messagesLoaded=true so subsequent persistSession calls take the fast path.
+  // Subsequent ensureMessagesLoaded calls also short-circuit, which is fine —
+  // queue recovery has already run here.
+  private hydrateMessagesForColdPersist(managed: ManagedSession): void {
+    sessionLog.debug(`Cold-load triggered for persistSession on ${managed.id}`)
+    const stored = loadStoredSession(managed.workspace.rootPath, managed.id)
+    if (stored) {
+      managed.messages = (stored.messages || []).map(storedToMessage)
+      managed.tokenUsage = stored.tokenUsage
+      // Deferred-load fields (intentionally undefined after startup, see
+      // loadSessionsFromDisk). Populate from disk only if not already set in
+      // memory — a caller may have mutated them via setSessionSources etc.
+      if (managed.enabledSourceSlugs === undefined) managed.enabledSourceSlugs = stored.enabledSourceSlugs
+      if (managed.lastReadMessageId === undefined) managed.lastReadMessageId = stored.lastReadMessageId
+      if (managed.hasUnread === undefined) managed.hasUnread = stored.hasUnread
+      if (managed.sharedUrl === undefined) managed.sharedUrl = stored.sharedUrl
+      if (managed.sharedId === undefined) managed.sharedId = stored.sharedId
+      if (managed.transferredSessionSummary === undefined) managed.transferredSessionSummary = stored.transferredSessionSummary
+      if (managed.transferredSessionSummaryApplied === undefined) managed.transferredSessionSummaryApplied = stored.transferredSessionSummaryApplied
+
+      // Queue recovery: find orphaned queued messages from crash/restart and re-queue them.
+      const orphanedQueued = managed.messages.filter(m =>
+        m.role === 'user' && m.isQueued === true
+      )
+      if (orphanedQueued.length > 0) {
+        sessionLog.info(`Recovering ${orphanedQueued.length} queued message(s) for session ${managed.id}`)
+        for (const msg of orphanedQueued) {
+          managed.messageQueue.push({
+            message: msg.content,
+            messageId: msg.id,
+            attachments: undefined,
+            storedAttachments: msg.attachments,
+            options: undefined,
+          })
+        }
+        if (!managed.isProcessing && managed.messageQueue.length > 0) {
+          setImmediate(() => {
+            this.processNextQueuedMessage(managed.id)
+          })
+        }
+      }
+      sessionLog.debug(`Cold-hydrated ${managed.messages.length} messages for session ${managed.id}`)
+    }
+    managed.messagesLoaded = true
+  }
+
+  // Build the StoredSession snapshot and hand it to the persistence queue.
+  // Caller must ensure `managed.messagesLoaded` is true.
+  private enqueuePersist(managed: ManagedSession): void {
     try {
       // Filter out transient status messages (progress indicators like "Compacting...")
       // Error messages are now persisted with rich fields for diagnostics
       const persistableMessages = managed.messages.filter(m =>
         m.role !== 'status'
       )
-
-      // If messages haven't been loaded yet (e.g., branched session not yet opened),
-      // skip persistence to avoid overwriting JSONL messages with empty array
-      if (!managed.messagesLoaded) {
-        return
-      }
 
       const storedSession: StoredSession = {
         ...pickSessionFields(managed),
@@ -1684,12 +1994,14 @@ export class SessionManager implements ISessionManager {
     }
   }
 
-  // Flush a specific session immediately (call on session close/switch)
+  // Flush a specific session immediately (call on session close/switch).
+  // Cold-persist hydration is synchronous, so by the time we reach here the
+  // queue already has an entry whenever persistSession was just called.
   async flushSession(sessionId: string): Promise<void> {
     await sessionPersistenceQueue.flush(sessionId)
   }
 
-  // Flush all pending sessions (call on app quit)
+  // Flush all pending sessions (call on app quit).
   async flushAllSessions(): Promise<void> {
     await sessionPersistenceQueue.flushAll()
   }
@@ -2229,6 +2541,7 @@ export class SessionManager implements ISessionManager {
       branchFromSessionPath?: string
       branchFromSdkCwd?: string
       branchFromSdkTurnId?: string
+      sourceProvider?: 'anthropic' | 'pi'
     } | undefined
 
     if (options?.branchFromSessionId || options?.branchFromMessageId) {
@@ -2392,6 +2705,7 @@ export class SessionManager implements ISessionManager {
         branchFromSessionPath,
         branchFromSdkCwd,
         branchFromSdkTurnId,
+        sourceProvider: sourceBackendContext.provider,
       }
 
       sessionLog.info('Branch validation succeeded', {
@@ -2453,6 +2767,29 @@ export class SessionManager implements ISessionManager {
         delete branchedStored.branchFromSdkTurnId
       }
       await saveStoredSession(branchedStored)
+
+      // Propagate the Pi turn-anchor sidecar into the branch so a downstream
+      // branch can still resolve anchors for messages copied here from the
+      // source. Without this step, branch-of-branch silently falls back to
+      // full-history fork — see craft-agents-oss#782.
+      if (
+        validatedBranch.branchContextStrategy === 'sdk-fork' &&
+        validatedBranch.sourceProvider === 'pi'
+      ) {
+        try {
+          await copyPiTurnAnchorsForBranch(
+            sourceDir,
+            branchDir,
+            branchedStored.messages.map((m) => m.id),
+          )
+        } catch (err) {
+          sessionLog.warn('Failed to copy Pi turn-anchors sidecar to branch', {
+            err,
+            sourceSessionId: validatedBranch.sourceSessionId,
+            branchSessionId: storedSession.id,
+          })
+        }
+      }
     }
 
     // Resolve connection/provider/auth/model using the provider-agnostic backend resolver.
@@ -2513,6 +2850,12 @@ export class SessionManager implements ISessionManager {
             workspaceRootPath,
             sessionId: storedSession.id,
             deleteFromRuntimeSessions: (id) => {
+              const m = this.sessions.get(id)
+              if (m?.autoRetryTimer) {
+                clearTimeout(m.autoRetryTimer)
+                m.autoRetryTimer = undefined
+              }
+              if (m) m.autoRetryPending = undefined
               this.sessions.delete(id)
             },
             deleteStoredSession,
@@ -2549,6 +2892,211 @@ export class SessionManager implements ISessionManager {
     return managedToSession(managed, isBranch ? { messages: managed.messages } : undefined)
   }
 
+  private async disposeManagedAgentRuntime(managed: ManagedSession, reason: string): Promise<void> {
+    const sessionId = managed.id
+
+    if (managed.agent) {
+      try {
+        if (managed.agent.disposeForRestart) {
+          await managed.agent.disposeForRestart()
+        } else {
+          managed.agent.dispose()
+        }
+      } catch (error) {
+        sessionLog.warn(`Failed to dispose agent for ${sessionId} during ${reason}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+
+    if (managed.poolServer) {
+      try {
+        await managed.poolServer.stop()
+      } catch (error) {
+        sessionLog.warn(`Failed to stop pool server for ${sessionId} during ${reason}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+
+    if (managed.mcpPool) {
+      try {
+        await managed.mcpPool.disconnectAll()
+      } catch (error) {
+        sessionLog.warn(`Failed to disconnect MCP pool for ${sessionId} during ${reason}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+
+    managed.agent = null
+    managed.poolServer = undefined
+    managed.mcpPool = undefined
+    managed.envOverrides = undefined
+    managed.agentReady = undefined
+    managed.agentReadyResolve = undefined
+    managed.backendRuntimeSignature = undefined
+    managed.backendRestartSignature = undefined
+    unregisterSessionScopedToolCallbacks(sessionId)
+  }
+
+  /**
+   * Refresh an existing agent's runtime config in place when the session's
+   * resolved connection signature has drifted from what the agent was created
+   * with. No-ops when the agent doesn't exist, when the signature still
+   * matches, or when the agent is mid-stream (the gate is `agent.isProcessing()`
+   * — `managed.isProcessing` is not used because `sendMessage` flips it before
+   * calling `getOrCreateAgent`, which would make every send-path refresh dead
+   * code).
+   *
+   * Concurrency: per-session serialization via `agentRefreshLocks`. A second
+   * caller (e.g. `sendMessage` arriving mid-`SAVE`-refresh) awaits the
+   * in-flight refresh, then re-evaluates from the post-refresh state — so the
+   * subsequent `agent.chat()` is sent only after the subprocess has applied
+   * the runtime update (or the agent has been disposed for recreation).
+   *
+   * The helper distinguishes two kinds of drift:
+   *   - Restart-required (provider/auth/slug/piAuthProvider): goes straight
+   *     to dispose + recreate because `update_runtime_config` cannot fully
+   *     re-route credential/provider state in a live subprocess.
+   *   - In-place safe (model/baseUrl/customEndpoint/customModels): attempts
+   *     `agent.updateRuntimeConfig` and falls back to dispose if the backend
+   *     can't apply the update.
+   */
+  private async tryRefreshAgentRuntime(managed: ManagedSession, reason: string): Promise<void> {
+    // Serialize against any in-flight refresh on this session. The waiter
+    // doesn't propagate the prior call's errors — those are logged at the
+    // origin call site.
+    const inflight = this.agentRefreshLocks.get(managed.id)
+    if (inflight) {
+      await inflight.catch(() => undefined)
+    }
+
+    if (!managed.agent) return
+
+    const workspaceConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+    const backendContext = resolveBackendContext({
+      sessionConnectionSlug: managed.llmConnection,
+      workspaceDefaultConnectionSlug: workspaceConfig?.defaults?.defaultLlmConnection,
+      managedModel: managed.model,
+    })
+    const connection = backendContext.connection
+    const sigInput = {
+      connection,
+      provider: backendContext.provider,
+      authType: backendContext.authType,
+      resolvedModel: backendContext.resolvedModel,
+    }
+    const runtimeSignature = buildBackendRuntimeSignature(sigInput)
+    const restartSignature = buildRestartRequiredSignature(sigInput)
+
+    if (!managed.backendRuntimeSignature || !managed.backendRestartSignature) {
+      managed.backendRuntimeSignature = runtimeSignature
+      managed.backendRestartSignature = restartSignature
+      return
+    }
+
+    const restartRequired = managed.backendRestartSignature !== restartSignature
+    const runtimeChanged = managed.backendRuntimeSignature !== runtimeSignature
+
+    if (!restartRequired && !runtimeChanged) return
+
+    if (managed.agent.isProcessing()) {
+      sessionLog.info(`Runtime config changed for ${managed.id}; deferring refresh until session is idle (${reason})`)
+      return
+    }
+
+    const work = this.runAgentRuntimeRefresh(
+      managed,
+      backendContext,
+      runtimeSignature,
+      restartSignature,
+      restartRequired,
+      reason,
+    )
+    // Track the work so concurrent callers serialize. Swallow errors on the
+    // tracked promise — the awaiter shouldn't get someone else's exception;
+    // errors are logged inside `runAgentRuntimeRefresh`.
+    const tracked = work.then(() => undefined, () => undefined)
+    this.agentRefreshLocks.set(managed.id, tracked)
+    try {
+      await work
+    } finally {
+      // Concurrent callers awaited `tracked` before reaching this point and
+      // each registered their own work serially, so the slot is always ours
+      // to clear when our own work resolves.
+      if (this.agentRefreshLocks.get(managed.id) === tracked) {
+        this.agentRefreshLocks.delete(managed.id)
+      }
+    }
+  }
+
+  private async runAgentRuntimeRefresh(
+    managed: ManagedSession,
+    backendContext: ReturnType<typeof resolveBackendContext>,
+    runtimeSignature: string,
+    restartSignature: string,
+    restartRequired: boolean,
+    reason: string,
+  ): Promise<void> {
+    if (restartRequired) {
+      sessionLog.info(`Restart-required field changed for session ${managed.id}; recreating backend runtime (${reason})`)
+      await this.disposeManagedAgentRuntime(managed, 'restart-required runtime change')
+      return
+    }
+
+    const connection = backendContext.connection
+    let refreshed = false
+    if (managed.agent?.updateRuntimeConfig) {
+      try {
+        refreshed = await managed.agent.updateRuntimeConfig({
+          model: backendContext.resolvedModel,
+          providerType: connection?.providerType,
+          authType: backendContext.authType,
+          runtime: connection ? {
+            baseUrl: connection.baseUrl,
+            piAuthProvider: connection.piAuthProvider,
+            customEndpoint: connection.customEndpoint,
+            customModels: connection.models?.map(model => {
+              if (typeof model === 'string') return model
+              const supportsImages = typeof model.supportsImages === 'boolean' ? model.supportsImages : undefined
+              if (model.contextWindow || supportsImages !== undefined) {
+                return {
+                  id: model.id,
+                  ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
+                  ...(supportsImages !== undefined ? { supportsImages } : {}),
+                }
+              }
+              return model.id
+            }),
+          } : undefined,
+        })
+      } catch (error) {
+        sessionLog.warn(`Runtime config in-place refresh failed for ${managed.id}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+
+    if (refreshed) {
+      managed.backendRuntimeSignature = runtimeSignature
+      managed.backendRestartSignature = restartSignature
+      sessionLog.info(`Refreshed runtime config for session ${managed.id} (${reason})`)
+    } else {
+      sessionLog.info(`Recreating backend runtime for session ${managed.id} after config change (${reason})`)
+      await this.disposeManagedAgentRuntime(managed, 'runtime config refresh')
+    }
+  }
+
+  /**
+   * Push a connection's runtime updates (e.g. `supportsImages` toggle) to every
+   * active session that uses it. Called from the `llmConnections.SAVE` handler
+   * so capability changes reach live Pi subprocesses immediately instead of
+   * waiting for the next send to lazily notice the signature drift.
+   */
+  async refreshConnectionRuntime(connectionSlug: string): Promise<void> {
+    for (const managed of this.sessions.values()) {
+      if (managed.llmConnection !== connectionSlug) continue
+      try {
+        await this.tryRefreshAgentRuntime(managed, 'connection update')
+      } catch (error) {
+        sessionLog.warn(`refreshConnectionRuntime failed for ${managed.id}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+  }
+
   /**
    * Get or create agent for a session (lazy loading)
    * Creates the appropriate backend agent based on LLM connection.
@@ -2560,16 +3108,29 @@ export class SessionManager implements ISessionManager {
    * 4. fallback: no connection configured
    */
   private async getOrCreateAgent(managed: ManagedSession): Promise<AgentInstance> {
+    // Refresh runtime config in-place when the connection has drifted since
+    // the agent was created. May null out `managed.agent` if the in-place
+    // refresh fails, in which case the create branch below rebuilds it.
+    await this.tryRefreshAgentRuntime(managed, 'send-path refresh')
+
+    const workspaceConfig = loadWorkspaceConfig(managed.workspace.rootPath)
+    const backendContext = resolveBackendContext({
+      sessionConnectionSlug: managed.llmConnection,
+      workspaceDefaultConnectionSlug: workspaceConfig?.defaults?.defaultLlmConnection,
+      managedModel: managed.model,
+    })
+    const connection = backendContext.connection
+    const sigInput = {
+      connection,
+      provider: backendContext.provider,
+      authType: backendContext.authType,
+      resolvedModel: backendContext.resolvedModel,
+    }
+    const runtimeSignature = buildBackendRuntimeSignature(sigInput)
+    const restartSignature = buildRestartRequiredSignature(sigInput)
+
     if (!managed.agent) {
       const end = perf.start('agent.create', { sessionId: managed.id })
-
-      const workspaceConfig = loadWorkspaceConfig(managed.workspace.rootPath)
-      const backendContext = resolveBackendContext({
-        sessionConnectionSlug: managed.llmConnection,
-        workspaceDefaultConnectionSlug: workspaceConfig?.defaults?.defaultLlmConnection,
-        managedModel: managed.model,
-      })
-      const connection = backendContext.connection
 
       // Lock the connection after first resolution
       // This ensures the session always uses the same provider
@@ -2686,6 +3247,16 @@ export class SessionManager implements ISessionManager {
         sessionPersistenceQueue.flush(managed.id)
       }
 
+      const onBranchForkInvalidated = () => {
+        managed.sdkSessionId = undefined
+        managed.branchFromSdkSessionId = undefined
+        managed.branchFromSdkCwd = undefined
+        managed.branchFromSdkTurnId = undefined
+        sessionLog.info(`Branch fork invalidated for ${managed.id}: cleared all fork metadata`)
+        this.persistSession(managed)
+        sessionPersistenceQueue.flush(managed.id)
+      }
+
       const getRecoveryMessages = () => {
         const relevantMessages = managed.messages
           .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -2761,6 +3332,7 @@ export class SessionManager implements ISessionManager {
         session: sessionConfig,
         onSdkSessionIdUpdate,
         onSdkSessionIdCleared,
+        onBranchForkInvalidated,
         getRecoveryMessages,
         getBranchFallbackMessages,
         getBranchSeedMessages,
@@ -2868,20 +3440,42 @@ export class SessionManager implements ISessionManager {
       }
 
       // Wire up browser pane tools — merge BrowserPaneFns into session callbacks
-      // so browser_* tools can delegate to BrowserPaneManager
-      if (this.browserPaneManager) {
-        const bpm = this.browserPaneManager
+      // so browser_* tools can delegate to BrowserPaneManager.
+      //
+      // Always register when EITHER a local BPM is set OR an RPC server is
+      // available (which lets `getBrowserPaneManagerForSession` lazily build a
+      // RemoteBrowserPaneManager). Calls fail per-method with
+      // BROWSER_NO_CAPABLE_CLIENT if no desktop client is connected, instead
+      // of "tool unavailable".
+      sessionLog.info('[browser-pane] BPF gate check', {
+        sessionId: managed.id,
+        hasLocalBpm: !!this.browserPaneManager,
+        hasRpcServer: !!this.rpcServer,
+      })
+      if (this.browserPaneManager || this.rpcServer) {
         const sid = managed.id
+        const bpm = this.getBrowserPaneManagerForSession(sid)
+        if (!bpm) {
+          throw new Error('Browser pane manager unavailable despite passing the gate — this is a bug.')
+        }
+        sessionLog.info('[browser-pane] BPF block resolved BPM', {
+          sessionId: sid,
+          bpmKind: this.browserPaneManager === bpm ? 'local' : 'remote',
+        })
 
-        const resolveSessionBrowserInstance = (toolName: string, options?: { show?: boolean }): string => {
-          const instanceId = bpm.createForSession(sid, { show: options?.show ?? false })
-          const info = bpm.getInstance(instanceId)
+        const workspaceId = managed.workspace.id
+        const resolveSessionBrowserInstance = async (toolName: string, options?: { show?: boolean }): Promise<string> => {
+          const instanceId = await bpm.createForSessionAsync(sid, {
+            show: options?.show ?? false,
+            workspaceId,
+          })
+          const info = await bpm.getInstanceAsync(instanceId)
           sessionLog.info(`[browser-pane] tool target resolved: ${toolName} session=${sid} instance=${instanceId} ownerType=${info?.ownerType ?? 'unknown'} ownerSessionId=${info?.ownerSessionId ?? 'none'} visible=${info?.isVisible ?? false}`)
           return instanceId
         }
 
-        const resolveLifecycleWindowTarget = (command: 'release' | 'close' | 'hide', requestedInstanceId?: string) => {
-          const windows = bpm.listInstances()
+        const resolveLifecycleWindowTarget = async (command: 'release' | 'close' | 'hide', requestedInstanceId?: string) => {
+          const windows = await bpm.listInstancesAsync()
 
           if (windows.length === 0) {
             return { windows, reason: 'No browser windows are available. Use "open" first.' }
@@ -2926,110 +3520,111 @@ export class SessionManager implements ISessionManager {
           return { windows, target: validated.target }
         }
 
+        sessionLog.info('[browser-pane] BPF registering browserPaneFns', { sessionId: sid })
         mergeSessionScopedToolCallbacks(sid, {
           browserPaneFns: {
             openPanel: async (options) => {
               const instanceId = options?.background
-                ? bpm.createForSession(sid, { show: false })
-                : bpm.focusBoundForSession(sid)
-              const info = bpm.getInstance(instanceId)
+                ? await bpm.createForSessionAsync(sid, { show: false, workspaceId })
+                : await bpm.focusBoundForSessionAsync(sid, { workspaceId })
+              const info = await bpm.getInstanceAsync(instanceId)
               sessionLog.info(`[browser-pane] route decision: browser_open session=${sid} instance=${instanceId} background=${options?.background ?? false} ownerType=${info?.ownerType ?? 'unknown'} ownerSessionId=${info?.ownerSessionId ?? 'none'} visible=${info?.isVisible ?? false}`)
               return { instanceId }
             },
-            navigate: (url) => {
-              const instanceId = resolveSessionBrowserInstance('browser_navigate')
+            navigate: async (url) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_navigate')
               return bpm.navigate(instanceId, url)
             },
-            snapshot: () => {
-              const instanceId = resolveSessionBrowserInstance('browser_snapshot')
+            snapshot: async () => {
+              const instanceId = await resolveSessionBrowserInstance('browser_snapshot')
               return bpm.getAccessibilitySnapshot(instanceId)
             },
-            click: (ref, options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_click')
+            click: async (ref, options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_click')
               return bpm.clickElement(instanceId, ref, options)
             },
-            clickAt: (x, y) => {
-              const instanceId = resolveSessionBrowserInstance('browser_click_at')
+            clickAt: async (x, y) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_click_at')
               return bpm.clickAtCoordinates(instanceId, x, y)
             },
-            drag: (x1, y1, x2, y2) => {
-              const instanceId = resolveSessionBrowserInstance('browser_drag')
+            drag: async (x1, y1, x2, y2) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_drag')
               return bpm.drag(instanceId, x1, y1, x2, y2)
             },
-            fill: (ref, value) => {
-              const instanceId = resolveSessionBrowserInstance('browser_fill')
+            fill: async (ref, value) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_fill')
               return bpm.fillElement(instanceId, ref, value)
             },
-            type: (text) => {
-              const instanceId = resolveSessionBrowserInstance('browser_type')
+            type: async (text) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_type')
               return bpm.typeText(instanceId, text)
             },
-            select: (ref, value) => {
-              const instanceId = resolveSessionBrowserInstance('browser_select')
+            select: async (ref, value) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_select')
               return bpm.selectOption(instanceId, ref, value)
             },
-            setClipboard: (text) => {
-              const instanceId = resolveSessionBrowserInstance('browser_set_clipboard')
+            setClipboard: async (text) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_set_clipboard')
               return bpm.setClipboard(instanceId, text)
             },
-            getClipboard: () => {
-              const instanceId = resolveSessionBrowserInstance('browser_get_clipboard')
+            getClipboard: async () => {
+              const instanceId = await resolveSessionBrowserInstance('browser_get_clipboard')
               return bpm.getClipboard(instanceId)
             },
-            screenshot: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_screenshot')
+            screenshot: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_screenshot')
               return bpm.screenshot(instanceId, options)
             },
-            screenshotRegion: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_screenshot_region')
+            screenshotRegion: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_screenshot_region')
               return bpm.screenshotRegion(instanceId, options)
             },
-            getConsoleLogs: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_console')
-              return Promise.resolve(bpm.getConsoleLogs(instanceId, options))
+            getConsoleLogs: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_console')
+              return bpm.getConsoleLogs(instanceId, options)
             },
-            windowResize: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_window_resize')
-              return Promise.resolve(bpm.windowResize(instanceId, options.width, options.height))
+            windowResize: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_window_resize')
+              return bpm.windowResize(instanceId, options.width, options.height)
             },
-            getNetworkLogs: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_network')
-              return Promise.resolve(bpm.getNetworkLogs(instanceId, options))
+            getNetworkLogs: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_network')
+              return bpm.getNetworkLogs(instanceId, options)
             },
-            waitFor: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_wait')
+            waitFor: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_wait')
               return bpm.waitFor(instanceId, options)
             },
-            sendKey: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_key')
+            sendKey: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_key')
               return bpm.sendKey(instanceId, options)
             },
-            getDownloads: (options) => {
-              const instanceId = resolveSessionBrowserInstance('browser_downloads')
+            getDownloads: async (options) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_downloads')
               return bpm.getDownloads(instanceId, options)
             },
-            upload: (ref, filePaths) => {
-              const instanceId = resolveSessionBrowserInstance('browser_upload')
+            upload: async (ref, filePaths) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_upload')
               return bpm.uploadFile(instanceId, ref, filePaths).then(() => {})
             },
-            scroll: (direction, amount) => {
-              const instanceId = resolveSessionBrowserInstance('browser_scroll')
+            scroll: async (direction, amount) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_scroll')
               return bpm.scroll(instanceId, direction, amount)
             },
-            goBack: () => {
-              const instanceId = resolveSessionBrowserInstance('browser_back')
+            goBack: async () => {
+              const instanceId = await resolveSessionBrowserInstance('browser_back')
               return bpm.goBack(instanceId)
             },
-            goForward: () => {
-              const instanceId = resolveSessionBrowserInstance('browser_forward')
+            goForward: async () => {
+              const instanceId = await resolveSessionBrowserInstance('browser_forward')
               return bpm.goForward(instanceId)
             },
-            evaluate: (expression) => {
-              const instanceId = resolveSessionBrowserInstance('browser_evaluate')
+            evaluate: async (expression) => {
+              const instanceId = await resolveSessionBrowserInstance('browser_evaluate')
               return bpm.evaluate(instanceId, expression)
             },
             focusWindow: async (targetInstanceId) => {
-              const windows = bpm.listInstances()
+              const windows = await bpm.listInstancesAsync()
               if (windows.length === 0) {
                 throw new Error('No browser windows available to focus. Use "open" first.')
               }
@@ -3051,11 +3646,11 @@ export class SessionManager implements ISessionManager {
               }
 
               if (!target.boundSessionId) {
-                bpm.bindSession(target.id, sid)
+                bpm.bindSession(target.id, sid, { workspaceId })
               }
 
               bpm.focus(target.id)
-              const focused = bpm.getInstance(target.id)
+              const focused = await bpm.getInstanceAsync(target.id)
               return {
                 instanceId: target.id,
                 title: focused?.title ?? target.title,
@@ -3064,10 +3659,10 @@ export class SessionManager implements ISessionManager {
             },
             releaseControl: async (requestedInstanceId) => {
               if (requestedInstanceId === 'all') {
-                const before = bpm.listInstances()
+                const before = await bpm.listInstancesAsync()
                 const beforeActive = before.filter((w) => !!w.agentControlActive).length
                 bpm.clearAgentControl(sid)
-                const after = bpm.listInstances()
+                const after = await bpm.listInstancesAsync()
                 const afterActive = after.filter((w) => !!w.agentControlActive).length
                 const released = afterActive < beforeActive
 
@@ -3081,7 +3676,7 @@ export class SessionManager implements ISessionManager {
                 }
               }
 
-              const resolution = resolveLifecycleWindowTarget('release', requestedInstanceId)
+              const resolution = await resolveLifecycleWindowTarget('release', requestedInstanceId)
               if (!resolution.target) {
                 sessionLog.info(`[browser-pane] lifecycle release session=${sid} requested=${requestedInstanceId ?? 'auto'} result=noop reason=${resolution.reason}`)
                 return {
@@ -3105,7 +3700,7 @@ export class SessionManager implements ISessionManager {
               }
             },
             closeWindow: async (requestedInstanceId) => {
-              const resolution = resolveLifecycleWindowTarget('close', requestedInstanceId)
+              const resolution = await resolveLifecycleWindowTarget('close', requestedInstanceId)
               if (!resolution.target) {
                 sessionLog.info(`[browser-pane] lifecycle close session=${sid} requested=${requestedInstanceId ?? 'auto'} result=noop reason=${resolution.reason}`)
                 return {
@@ -3127,7 +3722,7 @@ export class SessionManager implements ISessionManager {
               }
             },
             hideWindow: async (requestedInstanceId) => {
-              const resolution = resolveLifecycleWindowTarget('hide', requestedInstanceId)
+              const resolution = await resolveLifecycleWindowTarget('hide', requestedInstanceId)
               if (!resolution.target) {
                 sessionLog.info(`[browser-pane] lifecycle hide session=${sid} requested=${requestedInstanceId ?? 'auto'} result=noop reason=${resolution.reason}`)
                 return {
@@ -3149,10 +3744,10 @@ export class SessionManager implements ISessionManager {
               }
             },
             listWindows: async () => {
-              return bpm.listInstances()
+              return bpm.listInstancesAsync()
             },
             detectChallenge: async () => {
-              const instanceId = resolveSessionBrowserInstance('browser_detect_challenge')
+              const instanceId = await resolveSessionBrowserInstance('browser_detect_challenge')
               return bpm.detectSecurityChallenge(instanceId)
             },
           } satisfies BrowserPaneFns,
@@ -3322,7 +3917,10 @@ export class SessionManager implements ISessionManager {
 
             // Release browser overlay + session binding because the agent is no longer running.
             // Plan submission pauses execution until user review, so browser ownership should not remain locked.
-            await releaseBrowserOwnershipOnForcedStop(this.browserPaneManager, managed.id)
+            await releaseBrowserOwnershipOnForcedStop(
+              (sid) => this.getBrowserPaneManagerForSession(sid),
+              managed.id,
+            )
 
             // Send complete event so renderer knows processing stopped (include tokenUsage for real-time updates)
             this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage }, managed.workspace.id)
@@ -3377,7 +3975,10 @@ export class SessionManager implements ISessionManager {
           this.setProcessing(managed, false)
 
           // Release browser overlay + session binding because the agent is paused awaiting user auth.
-          void releaseBrowserOwnershipOnForcedStop(this.browserPaneManager, managed.id)
+          void releaseBrowserOwnershipOnForcedStop(
+            (sid) => this.getBrowserPaneManagerForSession(sid),
+            managed.id,
+          )
 
           // Send complete event so renderer knows processing stopped (include tokenUsage for real-time updates)
           this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage }, managed.workspace.id)
@@ -3458,8 +4059,8 @@ export class SessionManager implements ISessionManager {
 
       // Wire up session self-management tools (set_session_labels, set_session_status, etc.)
       mergeSessionScopedToolCallbacks(managed.id, {
-        setSessionLabelsFn: (sessionId: string | undefined, labels: string[]) => {
-          this.setSessionLabels(sessionId ?? managed.id, labels)
+        setSessionLabelsFn: async (sessionId: string | undefined, labels: string[]) => {
+          await this.setSessionLabels(sessionId ?? managed.id, labels)
         },
         setSessionStatusFn: async (sessionId: string | undefined, status: string) => {
           await this.setSessionStatus(sessionId ?? managed.id, status as SessionStatus)
@@ -3586,10 +4187,10 @@ export class SessionManager implements ISessionManager {
           // Claude SDK freezes mcpServers at query() start; Pi only picks up new proxy
           // tool defs on the next handlePrompt (`toolsChanged` flag in pi-agent-server).
           // Mark a pending restart on the agent — ClaudeAgent/PiAgent consume it after
-          // the next tool_result, yield source_activated, and forceAbort. The renderer's
-          // auto_retry effect then resends the original user message with a
-          // "[{slug} activated]" suffix — landing in a fresh turn with tools live.
-          // Same machinery as the tool-call-error auto-retry path.
+          // the next tool_result, yield source_activated, and forceAbort. The
+          // `source_activated` handler in this class then schedules a server-side
+          // resend of the original user message with a "[{slug} activated]" suffix —
+          // landing in a fresh turn with tools live (craft-agents-oss#804).
           const userMessage = managed.agent?.getCurrentTurnUserMessage?.() ?? ''
           if (userMessage) {
             managed.agent?.setPendingSourceActivationRestart({ sourceSlug, userMessage })
@@ -3704,6 +4305,8 @@ export class SessionManager implements ISessionManager {
           changedAt: diagnostics.lastChangedAt,
         })
       }
+      managed.backendRuntimeSignature = runtimeSignature
+      managed.backendRestartSignature = restartSignature
       end()
     }
     return managed.agent
@@ -3775,8 +4378,7 @@ export class SessionManager implements ISessionManager {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       managed.sessionStatus = sessionStatus
-      // Guard: suppress external metadata revert from fs.watch during atomic write
-      managed._metadataWriteGuardUntil = Date.now() + 5000
+      this.setMetadataWriteGuard(managed)
       // Persist in-memory state directly to avoid race with pending queue writes
       this.persistSession(managed)
       await this.flushSession(managed.id)
@@ -4764,9 +5366,13 @@ export class SessionManager implements ISessionManager {
     unregisterSessionScopedToolCallbacks(sessionId)
 
     // Destroy browser instances bound to this session
-    if (this.browserPaneManager) {
-      this.browserPaneManager.destroyForSession(sessionId)
+    const sessionBpm = this.getBrowserPaneManagerForSession(sessionId)
+    if (sessionBpm) {
+      sessionBpm.destroyForSession(sessionId)
     }
+    // Drop the per-session remote bridge + host-client pin on destroy.
+    this.remoteBpms.delete(sessionId)
+    this.browserHostByCanvas.delete(sessionId)
 
     // Dispose agent to clean up ConfigWatchers, event listeners, MCP connections
     if (managed.agent) {
@@ -4779,6 +5385,13 @@ export class SessionManager implements ISessionManager {
         sessionLog.warn(`Failed to stop pool server for ${sessionId}: ${err instanceof Error ? err.message : err}`)
       })
     }
+
+    // Cancel any pending source-activation auto-retry timer (craft-agents-oss#804).
+    if (managed.autoRetryTimer) {
+      clearTimeout(managed.autoRetryTimer)
+      managed.autoRetryTimer = undefined
+    }
+    managed.autoRetryPending = undefined
 
     this.sessions.delete(sessionId)
 
@@ -4815,10 +5428,28 @@ export class SessionManager implements ISessionManager {
      * (#616). Pre-persist errors still reject the outer promise as before.
      */
     onAck?: (messageId: string) => void,
+    /**
+     * Optional transport context. The `sessions.sendMessage` RPC handler passes
+     * `{ callerClientId: ctx.clientId }` so the SM can pin the desktop client
+     * that should host this session's browser tools. Pass undefined when calling
+     * directly (tests, intra-server flows) to leave the existing pin in place.
+     */
+    rpcContext?: { callerClientId?: string },
   ): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
       throw new Error(`Session ${sessionId} not found`)
+    }
+    this.setLastMessageClientId(sessionId, rpcContext?.callerClientId)
+
+    // Source-activation auto-retry dedup (craft-agents-oss#804). When the server
+    // has just scheduled or committed a "[<slug> activated]" retry, drop a matching
+    // duplicate that arrives from a legacy renderer still running the client-side
+    // auto_retry. The first matching caller wins (server timer or legacy RPC,
+    // whichever arrives first), subsequent matching calls within the deadline drop.
+    if (claimAutoRetryPending(managed, message) === 'drop') {
+      sessionLog.info(`sendMessage: dropped duplicate source-activation retry for ${sessionId}`)
+      return
     }
 
     // Clear any pending plan execution state when a new user message is sent.
@@ -4829,18 +5460,37 @@ export class SessionManager implements ISessionManager {
     // Ensure messages are loaded before we try to add new ones
     await this.ensureMessagesLoaded(managed)
 
-    // If currently processing, redirect mid-stream. Each backend decides its strategy:
-    // - Pi: steers (injects message, events continue through existing stream)
-    // - Claude: aborts internally, session layer queues for re-send
+    // If currently processing, behavior depends on the connection's
+    // `midStreamBehavior` (resolved via {@link resolveMidStreamBehavior},
+    // defaults to provider-appropriate value):
+    //
+    // - 'steer': try to deliver into the in-flight turn. Pi steers natively;
+    //   Claude emulates via PreToolUse hook. If `redirect()` returns false
+    //   (Claude with no live query, or backend can't steer), the backend has
+    //   already called forceAbort(Redirect) and we queue for replay.
+    // - 'queue': hold the message untouched; the current turn keeps running
+    //   to natural completion; replay as a new turn afterwards. NO call to
+    //   `agent.redirect()`, NO forceAbort, NO interruption.
     if (managed.isProcessing) {
+      const connection = resolveSessionConnection(managed.llmConnection, undefined)
+      // Fallback to 'steer' when no connection is resolvable — preserves
+      // today's exact behavior (call redirect, take whatever it returns).
+      const behavior = connection ? resolveMidStreamBehavior(connection) : 'steer'
+
       const agent = managed.agent
-      const steered = agent?.redirect(message) ?? false
+      let steered = false
+      if (behavior === 'steer') {
+        steered = agent?.redirect(message) ?? false
+      }
+      // For 'queue': skip redirect entirely. The current turn is undisturbed.
 
       sessionLog.info('mid-stream send', {
         sessionId,
+        behavior,
         steered,
         queueLengthBefore: managed.messageQueue.length,
         backend: agent ? agent.constructor.name : 'none',
+        connectionSlug: connection?.slug,
       })
 
       // Create user message for UI
@@ -4854,7 +5504,8 @@ export class SessionManager implements ISessionManager {
       }
       managed.messages.push(userMessage)
 
-      // Emit to UI — 'accepted' if steered (processing now), 'queued' if aborted (will re-send)
+      // Emit to UI — 'accepted' iff a steer succeeded; 'queued' otherwise
+      // (covers both queue-direct and queue-after-abort paths).
       this.sendEvent({
         type: 'user_message',
         sessionId,
@@ -4864,8 +5515,10 @@ export class SessionManager implements ISessionManager {
       }, managed.workspace.id)
 
       if (!steered) {
-        // Backend aborted — queue message for re-send after processing stops.
-        // forceAbort(Redirect) was already called by redirect().
+        // Push for FIFO replay on next onProcessingStopped tick. Same shape
+        // for both queue-direct (current turn still running) and
+        // queue-after-abort (backend already aborted) — the replay path in
+        // processNextQueuedMessage is identical.
         managed.messageQueue.push({ message, attachments, storedAttachments, options, messageId: userMessage.id, optimisticMessageId: options?.optimisticMessageId })
         managed.wasInterrupted = true
       }
@@ -5067,63 +5720,56 @@ export class SessionManager implements ISessionManager {
     // Start perf span for entire sendMessage flow
     const sendSpan = perf.span('session.sendMessage', { sessionId })
 
-    // Get or create the agent (lazy loading)
+    const workspaceRootPath = managed.workspace.rootPath
+    const enabledSlugs = managed.enabledSourceSlugs ?? []
+    const hasSources = enabledSlugs.length > 0
+
+    // Load enabled sources up-front so we can refresh tokens BEFORE getOrCreateAgent
+    // runs its internal cold-session build. Otherwise that build sees stale tokens
+    // and emits AUTH_REQUIRED, causing a brief "needs_auth" UI flicker before the
+    // post-build refresh restores state (#710).
+    const sources: LoadedSource[] = hasSources
+      ? getSourcesBySlugs(workspaceRootPath, enabledSlugs)
+      : []
+
+    if (hasSources && managed.tokenRefreshManager) {
+      const refreshResult = await refreshExpiredCredentials(sources, managed.tokenRefreshManager)
+      if (refreshResult.failedSources.length > 0) {
+        sessionLog.warn('[OAuth] Some sources failed token refresh:', refreshResult.failedSources.map(f => f.slug))
+      }
+      if (refreshResult.refreshedCount > 0) {
+        sendSpan.mark('oauth.refreshed')
+      }
+    }
+
+    // Get or create the agent (lazy loading). Its internal cold-session build at
+    // ~L2956 now sees fresh tokens (or correctly-needs_auth failed sources, since
+    // ensureFreshToken mirrors the disk write to source.config in-memory).
     const agent = await this.getOrCreateAgent(managed)
     sendSpan.mark('agent.ready')
 
     // Always set all sources for context (even if none are enabled), including built-ins
-    const workspaceRootPath = managed.workspace.rootPath
     const allSources = loadAllSources(workspaceRootPath)
     agent.setAllSources(allSources)
     sendSpan.mark('sources.loaded')
 
     // Apply source servers if any are enabled
-    if (managed.enabledSourceSlugs?.length) {
-      // Always build server configs fresh (no caching - single source of truth)
-      const sources = getSourcesBySlugs(workspaceRootPath, managed.enabledSourceSlugs)
-      // Pass session path so large API responses can be saved to session folder
+    if (hasSources) {
       const sessionPath = getSessionStoragePath(workspaceRootPath, sessionId)
+      // Single fresh build — tokens already refreshed above.
       const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath, managed.tokenRefreshManager, agent.getSummarizeCallback())
       if (errors.length > 0) {
         sessionLog.warn(`Source build errors:`, errors)
       }
 
-      // Proactive OAuth token refresh before applying servers to agent.
-      // This ensures tokens are fresh BEFORE the agent sees source state, avoiding a race
-      // where the agent receives a stale "needs_auth" status and triggers unnecessary re-auth
-      // even though the refresh succeeds moments later.
-      let tokensRefreshed = false
-      if (managed.tokenRefreshManager) {
-        const refreshResult = await refreshOAuthTokensIfNeeded(
-          agent,
-          sources,
-          sessionPath,
-          managed.tokenRefreshManager,
-          { sessionId, workspaceRootPath, poolServerUrl: managed.poolServer?.url }
-        )
-        if (refreshResult.failedSources.length > 0) {
-          sessionLog.warn('[OAuth] Some sources failed token refresh:', refreshResult.failedSources.map(f => f.slug))
-        }
-        if (refreshResult.tokensRefreshed) {
-          tokensRefreshed = true
-          sendSpan.mark('oauth.refreshed')
-        }
-      }
-
-      // Apply source servers to the agent.
-      // If tokens were refreshed, refreshOAuthTokensIfNeeded already rebuilt servers and
-      // called setSourceServers with fresh credentials — skip the duplicate call to avoid
-      // overwriting the post-refresh state with stale build results.
-      if (!tokensRefreshed) {
-        const mcpCount = Object.keys(mcpServers).length
-        const apiCount = Object.keys(apiServers).length
-        if (mcpCount > 0 || apiCount > 0 || managed.enabledSourceSlugs.length > 0) {
-          const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
-          const usableSources = sources.filter(isSourceUsable)
-          await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
-          await applyBridgeUpdates(agent, sessionPath, usableSources, mcpServers, sessionId, workspaceRootPath, 'send message', managed.poolServer?.url)
-          sessionLog.info(`Applied ${mcpCount} MCP + ${apiCount} API sources to session ${sessionId} (${allSources.length} total)`)
-        }
+      const mcpCount = Object.keys(mcpServers).length
+      const apiCount = Object.keys(apiServers).length
+      if (mcpCount > 0 || apiCount > 0 || enabledSlugs.length > 0) {
+        const usableSources = sources.filter(isSourceUsable)
+        const intendedSlugs = usableSources.map(s => s.config.slug)
+        await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
+        await applyBridgeUpdates(agent, sessionPath, usableSources, mcpServers, sessionId, workspaceRootPath, 'send message', managed.poolServer?.url)
+        sessionLog.info(`Applied ${mcpCount} MCP + ${apiCount} API sources to session ${sessionId} (${allSources.length} total)`)
       }
       sendSpan.mark('servers.applied')
     }
@@ -5161,8 +5807,29 @@ export class SessionManager implements ISessionManager {
         managed.wasInterrupted = false
       }
 
+      const messageBackendContext = resolveBackendContext({
+        sessionConnectionSlug: managed.llmConnection,
+        workspaceDefaultConnectionSlug: loadWorkspaceConfig(workspaceRootPath)?.defaults?.defaultLlmConnection,
+        managedModel: managed.model,
+      })
+      const modelInputAttachments = filterAttachmentsForModelInput(
+        attachments,
+        messageBackendContext.connection,
+        messageBackendContext.resolvedModel,
+      )
+      if (modelInputAttachments.omittedImages.length > 0) {
+        const omittedNames = modelInputAttachments.omittedImages.map(a => a.name).join(', ')
+        sessionLog.info(`Omitting ${modelInputAttachments.omittedImages.length} image attachment(s) from model input for ${messageBackendContext.resolvedModel}: ${omittedNames}`)
+        this.sendEvent({
+          type: 'info',
+          sessionId,
+          message: `Image attachment${modelInputAttachments.omittedImages.length === 1 ? '' : 's'} not sent because image input is disabled for ${messageBackendContext.resolvedModel}.`,
+          level: 'warning',
+        }, managed.workspace.id)
+      }
+
       sendSpan.mark('chat.starting')
-      const chatIterator = agent.chat(effectiveMessage, attachments)
+      const chatIterator = agent.chat(effectiveMessage, modelInputAttachments.attachments)
       sessionLog.info('Got chat iterator, starting iteration...')
 
       for await (const event of chatIterator) {
@@ -5546,8 +6213,9 @@ export class SessionManager implements ISessionManager {
     // Clear agent control overlay between turns. The session keeps browser
     // ownership (boundSessionId) — only the visual overlay is removed.
     // Full unbind happens below when the queue is empty (session truly done).
-    if (this.browserPaneManager) {
-      await this.browserPaneManager.clearVisualsForSession(sessionId)
+    const turnBpm = this.getBrowserPaneManagerForSession(sessionId)
+    if (turnBpm) {
+      await turnBpm.clearVisualsForSession(sessionId)
     }
 
     // 2. Handle unread state based on whether user is viewing this session
@@ -5597,9 +6265,10 @@ export class SessionManager implements ISessionManager {
       // Session is truly done — release browser ownership.
       // The window stays alive (hidden) and becomes reusable by future sessions.
       // On the next turn, getOrCreateForSession() will re-bind it.
-      if (this.browserPaneManager) {
-        await this.browserPaneManager.clearVisualsForSession(sessionId)
-        this.browserPaneManager.unbindAllForSession(sessionId)
+      const doneBpm = this.getBrowserPaneManagerForSession(sessionId)
+      if (doneBpm) {
+        await doneBpm.clearVisualsForSession(sessionId)
+        doneBpm.unbindAllForSession(sessionId)
       }
 
       // No queue - emit complete to UI (include tokenUsage and hasUnread for state updates)
@@ -5987,20 +6656,20 @@ export class SessionManager implements ISessionManager {
    * Set labels for a session (additive tags, many-per-session).
    * Labels are IDs referencing workspace labels/config.json.
    */
-  setSessionLabels(sessionId: string, labels: string[]): void {
+  async setSessionLabels(sessionId: string, labels: string[]): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
       managed.labels = labels
-      // Guard: suppress external metadata revert from fs.watch during atomic write
-      managed._metadataWriteGuardUntil = Date.now() + 5000
+      this.setMetadataWriteGuard(managed)
 
       this.sendEvent({
         type: 'labels_changed',
         sessionId: managed.id,
         labels: managed.labels,
       }, managed.workspace.id)
-      // Persist to disk
+      // Persist in-memory state directly to avoid race with pending queue writes
       this.persistSession(managed)
+      await this.flushSession(managed.id)
       // Workaround: Bun's fs.watch({ recursive: true }) on Linux doesn't track
       // directories created after the watcher started.
       // https://github.com/oven-sh/bun/issues/15939
@@ -6170,13 +6839,22 @@ export class SessionManager implements ISessionManager {
             }
           }
 
-          // Pi branch-cutoff support: persist provider-native turn anchor in session sidecar.
-          // Keeps session.jsonl schema unchanged while enabling strict branch cutoffs later.
-          if (event.sdkTurnAnchor) {
-            try {
-              await savePiTurnAnchor(sessionPath, assistantMessage.id, event.sdkTurnAnchor)
-            } catch (error) {
-              sessionLog.warn(`Failed to persist Pi turn anchor for session ${sessionId}:`, error)
+          // Pi branch-cutoff support: remember the SDK message id → Craft
+          // assistant message id mapping. The actual anchor arrives as a
+          // separate `pi_turn_anchor` event one microtask later — the SDK
+          // updates its leaf only AFTER firing message_end (see #782).
+          if (event.sdkMessageId) {
+            let cache = managed.piSdkMessageToCraftMessage
+            if (!cache) {
+              cache = new Map()
+              managed.piSdkMessageToCraftMessage = cache
+            }
+            cache.set(event.sdkMessageId, assistantMessage.id)
+            // Prune oldest entries when over the cap. Map preserves insertion
+            // order, so the first key is the oldest.
+            if (cache.size > PI_SDK_MESSAGE_ID_CACHE_LIMIT) {
+              const oldest = cache.keys().next().value
+              if (oldest !== undefined) cache.delete(oldest)
             }
           }
         }
@@ -6185,6 +6863,27 @@ export class SessionManager implements ISessionManager {
 
         // Persist session after complete message to prevent data loss on quit
         this.persistSession(managed)
+        break
+      }
+
+      case 'pi_turn_anchor': {
+        // Follow-up to a `text_complete` from the Pi backend, carrying the
+        // correct leaf id captured AFTER the SDK appended its assistant entry
+        // (the synchronous `message_end` listener could not see it — #782).
+        // Look up the Craft assistant message id by SDK message id and
+        // persist the anchor to the sidecar.
+        const cache = managed.piSdkMessageToCraftMessage
+        const craftMessageId = cache?.get(event.sdkMessageId)
+        if (!craftMessageId) {
+          sessionLog.debug(`pi_turn_anchor for unknown sdkMessageId=${event.sdkMessageId}; ignoring`)
+          break
+        }
+        const sessionPath = getSessionStoragePath(managed.workspace.rootPath, sessionId)
+        try {
+          await savePiTurnAnchor(sessionPath, craftMessageId, event.sdkTurnAnchor)
+        } catch (error) {
+          sessionLog.warn(`Failed to persist Pi turn anchor for session ${sessionId}:`, error)
+        }
         break
       }
 
@@ -6283,17 +6982,19 @@ export class SessionManager implements ISessionManager {
           formattedToolInput,
         )
 
-        if (this.browserPaneManager && shouldActivateOverlay) {
+        const overlayBpm = this.getBrowserPaneManagerForSession(sessionId)
+        if (overlayBpm && shouldActivateOverlay) {
           // Ensure first browser action in a turn gets an instance before overlay activation.
-          this.browserPaneManager.getOrCreateForSession(sessionId)
+          overlayBpm.getOrCreateForSession(sessionId, { workspaceId })
 
           const resolvedDisplayName = toolDisplayMeta?.displayName
             ?? event.displayName
             ?? event.toolName
-          this.browserPaneManager.setAgentControl(sessionId, {
-            displayName: resolvedDisplayName,
-            intent: event.intent,
-          })
+          overlayBpm.setAgentControl(
+            sessionId,
+            { displayName: resolvedDisplayName, intent: event.intent },
+            { workspaceId },
+          )
         }
 
         // Send event to renderer on first occurrence OR when input data is updated
@@ -6636,16 +7337,64 @@ export class SessionManager implements ISessionManager {
         }, workspaceId)
         break
 
-      case 'source_activated':
-        // A source was auto-activated mid-turn, forward to renderer for auto-retry
-        sessionLog.info(`Source "${event.sourceSlug}" activated, notifying renderer for auto-retry`)
+      case 'source_activated': {
+        // A source was auto-activated mid-turn. The server schedules a re-send of the
+        // original message with a "[<slug> activated]" suffix so headless deployments
+        // (WebUI, docker server) chain activations the same way the renderer used to.
+        // The renderer still receives the event to render activation feedback, but no
+        // longer fires its own auto_retry (see processor.ts).
+        sessionLog.info(`Source "${event.sourceSlug}" activated for session ${sessionId}, scheduling auto-retry`)
+
         this.sendEvent({
           type: 'source_activated',
           sessionId,
           sourceSlug: event.sourceSlug,
           originalMessage: event.originalMessage,
         }, workspaceId)
+
+        if (!managed) break
+
+        const originalMessage = event.originalMessage ?? ''
+        if (!originalMessage.trim()) {
+          sessionLog.warn(`Source "${event.sourceSlug}" activated for session ${sessionId}, but originalMessage was empty; skipping auto-retry`)
+          break
+        }
+
+        const messageWithSuffix = `${originalMessage}\n\n[${event.sourceSlug} activated]`
+        const messageCountAtSchedule = managed.messages.length
+
+        // Stash the retry payload so a duplicate sendMessage from a legacy renderer
+        // (mixed-version rollout: new server + v0.9.5 Electron client) gets deduped.
+        // 2s window covers WS latency tail on flaky mobile / proxy links.
+        managed.autoRetryPending = {
+          content: messageWithSuffix,
+          deadlineMs: Date.now() + 2000,
+          committed: false,
+        }
+
+        if (managed.autoRetryTimer) clearTimeout(managed.autoRetryTimer)
+        managed.autoRetryTimer = setTimeout(() => {
+          const current = this.sessions.get(sessionId)
+          if (!current) return
+          current.autoRetryTimer = undefined
+
+          // If a user follow-up arrived in the 100ms window, skip — they preempted us.
+          if (current.messages.length > messageCountAtSchedule) {
+            sessionLog.info(`Auto-retry skipped for ${sessionId}: follow-up message arrived first`)
+            current.autoRetryPending = undefined
+            return
+          }
+
+          // Note: do NOT clear autoRetryPending here — sendMessage() needs to see it
+          // so a legacy renderer's duplicate RPC arriving ~50ms later gets dropped.
+          // The pending slot is cleared by the deadline check in sendMessage, by the
+          // next matching sendMessage that drops as a duplicate, or by session deletion.
+          this.sendMessage(sessionId, messageWithSuffix).catch(err => {
+            sessionLog.error(`Auto-retry sendMessage failed for ${sessionId}:`, err)
+          })
+        }, 100)
         break
+      }
 
       case 'complete':
         // Complete event from CraftAgent - accumulate usage from this turn
@@ -6808,6 +7557,7 @@ export class SessionManager implements ISessionManager {
       model,
       thinkingLevel,
       automationName,
+      telegramTopic,
     } = input
 
     // Warn if llmConnection was specified but doesn't resolve
@@ -6853,6 +7603,26 @@ export class SessionManager implements ISessionManager {
     // before streaming events arrive. Without this, the renderer may create
     // a synthetic empty session and temporarily show "New chat".
     this.sendEvent({ type: 'session_created', sessionId: session.id }, workspaceId)
+
+    // Bind the new session to its Telegram forum topic if the matcher
+    // declared `telegramTopic`. Done before `sendMessage` so the first
+    // assistant tokens already route through the bound topic. Failure
+    // is logged inside the binder; the session continues unbound.
+    if (this.automationBinder && telegramTopic && telegramTopic.trim().length > 0) {
+      try {
+        await this.automationBinder({
+          workspaceId,
+          sessionId: session.id,
+          topicName: telegramTopic.trim(),
+        })
+      } catch (err) {
+        sessionLog.warn('[Automations] automation binder threw', {
+          sessionId: session.id,
+          telegramTopic,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
 
     // Send the prompt
     await this.sendMessage(session.id, prompt, undefined, undefined, {
